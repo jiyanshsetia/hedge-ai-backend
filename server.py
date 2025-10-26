@@ -1,164 +1,182 @@
+import os
 import time
 import json
 import threading
-from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, Query
+from datetime import datetime
+
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from kiteconnect import KiteConnect
+from dotenv import load_dotenv
 
-########################################
-# HARD-CODED CONFIG
-########################################
+# NEW: CORS so Shopify browser can call this API
+from fastapi.middleware.cors import CORSMiddleware
 
-ADMIN_KEY = "HedgeAI_Admin_2025"
+load_dotenv()
 
-# Zerodha Kite app credentials
-KITE_API_KEY = "0r1dt27vy4vqg86q"
-KITE_API_SECRET = "3p5f50cd717o35vo4t5cto2714fpn1us"
-
-# poll interval for live index snapshot (sec)
-POLL_INTERVAL_SECONDS = 60
-
-# index mapping and lot sizes (updated BANKNIFTY lot = 35)
-INSTRUMENTS = {
-    "NIFTY_50": {
-        "kite_symbol": "NSE:NIFTY 50",
-        "lot_size": 75
-    },
-    "BANKNIFTY": {
-        "kite_symbol": "NSE:BANKNIFTY",
-        "lot_size": 35
-    },
-    # can add FINNIFTY etc later
-}
+# ====== CONFIG ======
+ADMIN_KEY = os.getenv("ADMIN_KEY", "HedgeAI_Admin_2025")
+KITE_API_KEY = os.getenv("KITE_API_KEY", "0r1dt27vy4vqg86q")
+KITE_API_SECRET = os.getenv("KITE_API_SECRET", "3p5f50cd717o35vo4t5cto2714fpn1us")
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
 SNAPSHOT_FILE = "last_snapshot.json"
+ACCESS_FILE = "current_access_token.txt"
 
-########################################
-# GLOBAL STATE
-########################################
-
-app = FastAPI()
-
-CURRENT_ACCESS_TOKEN: Optional[str] = None
-
+# ====== GLOBAL STATE ======
 CACHE = {
     "cached_at": None,
-    "spot": {},       # {"NIFTY_50": 25795.15, "BANKNIFTY": 43000.0}
-    "chain": {},
-    "stale": True
+    "spot": {},
+    "chain": {"note": "option greeks / IV coming soon"},
+    "stale": True,  # True means "this is last close / not live"
+    "lot_sizes": {
+        "NIFTY_50": 75,
+        "BANKNIFTY": 35
+    }
 }
 
-########################################
-# HELPERS
-########################################
+CURRENT_ACCESS_TOKEN = ""
 
-def load_snapshot_from_disk():
-    global CACHE
-    try:
-        with open(SNAPSHOT_FILE, "r") as f:
-            data = json.load(f)
-        CACHE["cached_at"] = data.get("cached_at")
-        CACHE["spot"] = data.get("spot", {})
-        CACHE["chain"] = data.get("chain", {})
-        CACHE["stale"] = True  # snapshot = stale
-        print("[SNAPSHOT LOADED]", CACHE["cached_at"], CACHE["spot"])
-    except FileNotFoundError:
-        print("[SNAPSHOT] no snapshot file yet")
-    except Exception as e:
-        print("[SNAPSHOT ERROR]", str(e))
 
-def save_snapshot_to_disk():
-    try:
-        snap = {
-            "cached_at": CACHE["cached_at"],
-            "spot": CACHE["spot"],
-            "chain": CACHE["chain"],
-        }
-        with open(SNAPSHOT_FILE, "w") as f:
-            json.dump(snap, f, indent=2)
-        print("[SNAPSHOT SAVED]", CACHE["cached_at"], CACHE["spot"])
-    except Exception as e:
-        print("[SNAPSHOT SAVE ERROR]", str(e))
+# ====== FASTAPI APP ======
+app = FastAPI()
 
-def get_kite():
-    """Return a KiteConnect instance with the current access token set."""
-    if not CURRENT_ACCESS_TOKEN:
-        raise Exception("No access token set yet")
-    kite_local = KiteConnect(api_key=KITE_API_KEY)
-    kite_local.set_access_token(CURRENT_ACCESS_TOKEN)
-    return kite_local
+# Allow calls from anywhere (Shopify store domain etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # you can later lock this to your Shopify domain
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def fetch_once():
-    """
-    Pull quotes (NIFTY, BANKNIFTY spot).
-    Update CACHE with latest prices.
-    Save snapshot.
-    """
-    global CACHE
-    if not CURRENT_ACCESS_TOKEN:
-        # can't fetch yet
-        return
-
-    try:
-        kite_local = get_kite()
-
-        symbols = [cfg["kite_symbol"] for cfg in INSTRUMENTS.values()]
-        quote_data = kite_local.quote(symbols)
-
-        spot_result = {}
-        for name, cfg in INSTRUMENTS.items():
-            sym = cfg["kite_symbol"]
-            if sym in quote_data:
-                spot_result[name] = quote_data[sym]["last_price"]
-
-        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        CACHE["cached_at"] = now_str
-        CACHE["spot"] = spot_result
-        CACHE["chain"] = {
-            "note": "option greeks / IV coming soon"
-        }
-        CACHE["stale"] = False
-
-        print("[FETCH OK]", now_str, spot_result)
-        save_snapshot_to_disk()
-
-    except Exception as e:
-        print("[FETCH ERROR]", str(e))
-        # keep old CACHE for weekend / downtime
-
-def fetch_market_data_loop():
-    print("[THREAD] fetch_market_data_loop started")
-    while True:
-        fetch_once()
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-########################################
-# MODELS
-########################################
 
 class TokenBody(BaseModel):
     access_token: str
 
-########################################
-# ROUTES: BASIC
-########################################
+
+def load_snapshot_from_disk():
+    """Load last known prices from disk into CACHE so weekend/offline still shows data."""
+    global CACHE
+    if not os.path.exists(SNAPSHOT_FILE):
+        print("[SNAPSHOT] no snapshot file yet")
+        return
+    try:
+        with open(SNAPSHOT_FILE, "r") as f:
+            snap = json.load(f)
+        CACHE["cached_at"] = snap.get("cached_at")
+        CACHE["spot"] = snap.get("spot", {})
+        CACHE["stale"] = True  # snapshot is always considered stale
+        print("[SNAPSHOT LOADED]", CACHE["cached_at"], CACHE["spot"])
+    except Exception as e:
+        print("[SNAPSHOT ERROR]", e)
+
+
+def save_snapshot_to_disk():
+    """Save CACHE spot + timestamp so next boot (or weekend) has data."""
+    try:
+        snap = {
+            "cached_at": CACHE["cached_at"],
+            "spot": CACHE["spot"]
+        }
+        with open(SNAPSHOT_FILE, "w") as f:
+            json.dump(snap, f)
+        print("[SNAPSHOT SAVED]", snap)
+    except Exception as e:
+        print("[SNAPSHOT SAVE ERROR]", e)
+
+
+def fetch_market_data_loop():
+    """
+    Background loop running inside Render:
+    - uses CURRENT_ACCESS_TOKEN
+    - pulls market data from Zerodha
+    - updates CACHE
+    - writes snapshot to disk
+    """
+    global CURRENT_ACCESS_TOKEN, CACHE
+    print("[THREAD] fetch_market_data_loop started")
+
+    while True:
+        try:
+            if not CURRENT_ACCESS_TOKEN:
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            kite_local = KiteConnect(api_key=KITE_API_KEY)
+            kite_local.set_access_token(CURRENT_ACCESS_TOKEN)
+
+            # Get quotes for indices
+            # NOTE: BANKNIFTY sometimes needs "NSE:BANKNIFTY" or "NSE:NIFTY BANK"
+            # We'll try NIFTY first; if BANKNIFTY fails we'll just skip it.
+            data_to_fetch = ["NSE:NIFTY 50", "NSE:BANKNIFTY"]
+            try:
+                quote_data = kite_local.quote(data_to_fetch)
+            except Exception as inner_e:
+                # try fallback alt symbol for banknifty
+                print("[QUOTE ERROR primary]", inner_e)
+                try:
+                    quote_data = kite_local.quote(["NSE:NIFTY 50", "NSE:NIFTY BANK"])
+                except Exception as inner_e2:
+                    print("[QUOTE ERROR fallback]", inner_e2)
+                    quote_data = {}
+
+            new_spot = {}
+            if "NSE:NIFTY 50" in quote_data:
+                new_spot["NIFTY_50"] = quote_data["NSE:NIFTY 50"]["last_price"]
+
+            # banknifty might come from either key
+            if "NSE:BANKNIFTY" in quote_data:
+                new_spot["BANKNIFTY"] = quote_data["NSE:BANKNIFTY"]["last_price"]
+            elif "NSE:NIFTY BANK" in quote_data:
+                new_spot["BANKNIFTY"] = quote_data["NSE:NIFTY BANK"]["last_price"]
+
+            if new_spot:
+                CACHE["spot"] = new_spot
+                CACHE["cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                CACHE["stale"] = False  # fresh pull
+                print("[FETCH OK]", CACHE["cached_at"], CACHE["spot"])
+
+                # save snapshot so we have fallback on reboot/weekend
+                save_snapshot_to_disk()
+
+            else:
+                print("[FETCH WARN] got no new_spot from quote()")
+
+        except Exception as e:
+            print("[FETCH ERROR]", str(e))
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
 
 @app.on_event("startup")
 def on_startup():
+    global CURRENT_ACCESS_TOKEN
+    # load last token from disk (if exists)
+    if os.path.exists(ACCESS_FILE):
+        try:
+            with open(ACCESS_FILE, "r") as f:
+                CURRENT_ACCESS_TOKEN = f.read().strip()
+            print("[TOKEN LOADED FROM DISK]", CURRENT_ACCESS_TOKEN[:6] + "******")
+        except Exception as e:
+            print("[TOKEN LOAD ERROR]", e)
+    # load snapshot for weekend / cold boot
     load_snapshot_from_disk()
+    # start background fetch thread
     t = threading.Thread(target=fetch_market_data_loop, daemon=True)
     t.start()
+
 
 @app.get("/")
 def home():
     return {
-        "message": "HedgeAI backend running",
+        "message": "HedgeAI backend live",
         "token_present": bool(CURRENT_ACCESS_TOKEN),
-        "cached_at": CACHE["cached_at"]
+        "cached_at": CACHE["cached_at"],
+        "stale": CACHE["stale"],
     }
+
 
 @app.get("/health")
 def health():
@@ -166,103 +184,83 @@ def health():
         "status": "ok",
         "token_present": bool(CURRENT_ACCESS_TOKEN),
         "cached_at": CACHE["cached_at"],
-        "stale": CACHE.get("stale", True),
+        "stale": CACHE["stale"],
     }
+
 
 @app.get("/latest")
 def latest():
-    # if we never fetched after boot, try loading snapshot again
-    if CACHE["cached_at"] is None and not CACHE["spot"]:
-        load_snapshot_from_disk()
-
-    if CACHE["cached_at"] is None and not CACHE["spot"]:
-        return JSONResponse({"message": "No cached data yet"}, status_code=200)
-
+    # Always answer with CACHE + lot_sizes so frontend can build UI
     return {
         "status": "ok",
-        "data": {
-            "cached_at": CACHE["cached_at"],
-            "spot": CACHE["spot"],
-            "chain": CACHE["chain"],
-            "stale": CACHE.get("stale", True),
-            "lot_sizes": {name: cfg["lot_size"] for name, cfg in INSTRUMENTS.items()}
-        }
+        "data": CACHE,
     }
 
-########################################
-# ROUTE: ADMIN SET TOKEN
-########################################
 
 @app.post("/admin/set_token")
 async def set_token(request: Request, body: TokenBody):
     """
-    You call this with curl:
-    curl -X POST "http://127.0.0.1:8000/admin/set_token" \
+    You call this manually with curl each morning to update Zerodha token:
+    curl -X POST "https://hedge-ai.onrender.com/admin/set_token" \
       -H "Content-Type: application/json" \
       -H "X-ADMIN-KEY: HedgeAI_Admin_2025" \
-      -d '{"access_token":"<ACCESS_TOKEN_HERE>"}'
+      -d '{"access_token":"YOUR_TOKEN"}'
     """
     global CURRENT_ACCESS_TOKEN
-
     admin_header = request.headers.get("X-ADMIN-KEY", "")
+
     if admin_header != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized admin key")
 
-    if not body.access_token or len(body.access_token) < 5:
-        raise HTTPException(status_code=422, detail="Bad token format")
+    token = body.access_token.strip()
+    if len(token) < 5:
+        raise HTTPException(status_code=400, detail="Bad token")
 
-    CURRENT_ACCESS_TOKEN = body.access_token
+    CURRENT_ACCESS_TOKEN = token
     print("[TOKEN UPDATED VIA ADMIN]", CURRENT_ACCESS_TOKEN[:6] + "******")
 
+    # Save to disk so it persists across deploy / restart
     try:
-        with open("current_access_token.txt", "w") as f:
+        with open(ACCESS_FILE, "w") as f:
             f.write(CURRENT_ACCESS_TOKEN)
         print("[TOKEN SAVED TO DISK]")
     except Exception as e:
-        print("[TOKEN SAVE ERROR]", str(e))
-
-    # attempt immediate fetch so CACHE is warm
-    fetch_once()
+        print("[TOKEN SAVE ERROR]", e)
 
     return {"status": "ok", "message": "token saved and fetch started"}
 
-########################################
-# ROUTE: OPTION QUOTE (PREMIUM + IV)
-########################################
 
 @app.get("/option_quote")
 def option_quote(
-    instrument: str = Query(..., description="e.g. NIFTY_50 or BANKNIFTY"),
-    expiry: str = Query(..., description="e.g. 28 Oct 2025"),
-    strike: float = Query(..., description="e.g. 25800"),
-    opt_type: str = Query(..., description="'CALL' or 'PUT'")
+    instrument: str,
+    expiry: str,
+    strike: float,
+    opt_type: str,
 ):
     """
-    Returns premium (LTP) and IV for a specific option contract.
-    Frontend will call this when user selects expiry/strike/type.
+    Placeholder for now.
+    Frontend calls this to fill Premium & IV box.
 
-    We have to map (instrument, expiry, strike, CALL/PUT)
-    to the trading symbol Zerodha expects.
+    We'll later map instrument+expiry+strike+type -> Zerodha instrument token,
+    call kite.quote() on that single option contract,
+    and return last_price + implied volatility.
 
-    NOTE:
-    - Actual instrument_token / tradingsymbol naming for Zerodha index options looks like:
-      NIFTY25OCT25800CE or BANKNIFTY25OCT25800CE etc.
-    - This is slightly tricky because it's YYMMMDD / YYMON... style.
-    - We'll TEMPORARILY return dummy values so frontend can wire.
-    - Next step we'll generate correct tradingsymbol from expiry.
+    For now return dummies so UI shows numbers instead of '—'.
     """
+    try:
+        strike_val = float(strike)
+    except:
+        strike_val = None
 
-    # TEMP MOCK RESPONSE so UI works:
-    # after wiring frontend, we'll replace this with real kite.quote([tradingsymbol])
-    dummy_premium = 120.50
+    dummy_premium = 120.5
     dummy_iv = 14.2
 
     return {
         "status": "ok",
         "instrument": instrument,
         "expiry": expiry,
-        "strike": strike,
+        "strike": strike_val,
         "type": opt_type,
         "premium": dummy_premium,
-        "iv": dummy_iv
+        "iv": dummy_iv,
     }
