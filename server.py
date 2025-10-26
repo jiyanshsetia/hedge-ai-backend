@@ -5,6 +5,18 @@ import json
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Allow all origins (for Shopify embed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # you can restrict to your domain later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 from pydantic import BaseModel
 from kiteconnect import KiteConnect
 from dotenv import load_dotenv
