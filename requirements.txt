@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-dotenv
+kiteconnect
+requests
+pydantic
+requests
