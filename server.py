@@ -262,122 +262,120 @@ def expiries(instrument: str):
         }
 
 
-@app.get("/option_quote")
-def option_quote(instrument: str, expiry: str, strike: str, opt_type: str):
-    """
-    Return premium + IV for a specific option contract:
-    - instrument: "NIFTY_50" or "BANKNIFTY"
-    - expiry: "2025-10-28" (YYYY-MM-DD)
-    - strike: "25800" (string/number)
-    - opt_type: "CE" or "PE"
-    """
+from fastapi import Query
 
+# helper: convert "28 Oct 2025" -> Zerodha style expiry like "2025-10-28"
+def parse_expiry_label_to_yyyy_mm_dd(expiry_label: str):
+    # expiry_label will usually be "28 Oct 2025" from frontend
+    import datetime
+    try:
+        d = datetime.datetime.strptime(expiry_label, "%d %b %Y")
+        return d.strftime("%Y-%m-%d")
+    except:
+        # maybe frontend already sent "2025-10-28"
+        return expiry_label
+
+# helper: build tradingsymbol for NIFTY options, e.g. "NIFTY25O2825650CE"
+# NOTE: Zerodha naming is like: INDEX + YY + MLETTER + D + STRIKE + CE/PE
+# We will keep this simple and approximate.
+def build_option_symbol_nifty(expiry_yyyy_mm_dd: str, strike: int, opttype: str):
+    # opttype: "CE" or "PE"
+    # expiry_yyyy_mm_dd: "2025-10-28"
+    import datetime
+    dt = datetime.datetime.strptime(expiry_yyyy_mm_dd, "%Y-%m-%d")
+
+    # Zerodha weekly format is like NIFTY25O2825650CE:
+    #  - "NIFTY"
+    #  - YY last 2 digits
+    #  - month as single capital letter (Jan=A, Feb=B, ... Oct=O, Nov=P, Dec=X)
+    #  - day (no leading zero)
+    #  - strike
+    #  - CE/PE
+    #
+    # We'll map month -> letter like NSE convention for weekly index options.
+    month_code_map = {
+        1:"A",2:"B",3:"C",4:"D",5:"E",6:"F",7:"G",8:"H",9:"I",10:"O",11:"P",12:"X"
+    }
+    yy = str(dt.year)[2:]
+    mcode = month_code_map[dt.month]
+    day_no_leading_zero = str(dt.day)
+    tsym = f"NIFTY{yy}{mcode}{day_no_leading_zero}{int(strike)}{opttype.upper()}"
+    return tsym
+
+@app.get("/quote")
+def get_option_quote(
+    instrument: str = Query(..., description="e.g. NIFTY_50"),
+    expiry: str = Query(..., description="e.g. '28 Oct 2025' or '2025-10-28'"),
+    strike: int = Query(..., description="e.g. 25800"),
+    type: str = Query(..., description="'CE' or 'PE'")
+):
+    """
+    Return REAL market data for a single option contract.
+    This is the ONLY source of option price for the frontend.
+    """
     global CURRENT_ACCESS_TOKEN
 
-    # safe fallback so frontend doesn't die
-    fallback = {
-        "premium": None,
-        "iv": None,
-        "lot_size": CACHE["lot_sizes"].get(instrument, 75),
-        "note": "fallback/no token or not found"
-    }
-
     if not CURRENT_ACCESS_TOKEN:
-        return fallback
+        raise HTTPException(status_code=500, detail="No access token loaded")
+
+    # only supporting NIFTY right now
+    if instrument.upper() not in ["NIFTY", "NIFTY_50", "NIFTY50", "NIFTY 50"]:
+        raise HTTPException(status_code=400, detail="instrument not supported yet")
+
+    expiry_std = parse_expiry_label_to_yyyy_mm_dd(expiry)
 
     try:
         kite_local = KiteConnect(api_key=KITE_API_KEY)
         kite_local.set_access_token(CURRENT_ACCESS_TOKEN)
 
-        # 1. load instrument dump once per request
-        all_instr = kite_local.instruments()
+        tradingsymbol = build_option_symbol_nifty(expiry_std, strike, type)
+        # Zerodha index options for NIFTY are on NSE index option segment "NFO"
+        # So instrument_token is "NFO:"+tradingsymbol
+        full_symbol = f"NFO:{tradingsymbol}"
 
-        # map "NIFTY_50" -> "NIFTY" underlying in Zerodha
-        if instrument == "NIFTY_50":
-            underlying_symbol = "NIFTY"
-        elif instrument == "BANKNIFTY":
-            underlying_symbol = "BANKNIFTY"
-        else:
-            underlying_symbol = "NIFTY"  # default
+        q = kite_local.quote([full_symbol])
+        # q looks like { "NFO:NIFTY25O2825650CE": { "last_price": 191.2, ... }}
 
-        # normalize strike to numeric so we can match exactly
-        try:
-            strike_val = float(strike)
-        except:
-            # if somehow we get "25800.0" vs "25800", we'll try float compare later
-            strike_val = float(strike.replace(",", ""))
+        data = q.get(full_symbol)
+        if not data:
+            raise Exception("No data for that contract")
 
-        # normalize expiry -> date object string 'YYYY-MM-DD'
-        target_exp = expiry.strip()  # we already get "2025-10-28" style
+        option_price = data.get("last_price")
+        iv = data.get("implied_volatility")  # sometimes provided
+        # Zerodha quote() doesn't directly spit greeks for index options
+        # We'll send null for now. Frontend can estimate if it wants.
+        delta = None
+        theta = None
+        vega  = None
 
-        # 2. find the row in instruments() that matches all of these:
-        #    - NFO-OPT
-        #    - name == underlying_symbol
-        #    - instrument_type == opt_type (CE/PE)
-        #    - strike == strike_val
-        #    - expiry matches target_exp
-        match_row = None
-        for row in all_instr:
-            if row.get("segment") != "NFO-OPT":
-                continue
+        # you already know your lot sizes:
+        lot_size_map = {
+            "NIFTY": 75,
+            "NIFTY_50": 75,
+            "NIFTY 50": 75,
+            "NIFTY50": 75
+        }
+        lotSize = lot_size_map.get(instrument.upper(), 75)
 
-            # Zerodha uses "name" or sometimes "tradingsymbol" prefix to indicate underlying
-            # We'll check both.
-            if row.get("name") != underlying_symbol and not str(row.get("tradingsymbol","")).startswith(underlying_symbol):
-                continue
-
-            if row.get("instrument_type") != opt_type:
-                continue
-
-            # strike_price is float, compare
-            if float(row.get("strike", 0.0)) != strike_val:
-                continue
-
-            # expiry compare:
-            exp_val = row.get("expiry")
-            # expiry can be datetime.date/datetime or string
-            if hasattr(exp_val, "strftime"):
-                exp_fmt = exp_val.strftime("%Y-%m-%d")
-            else:
-                exp_fmt = str(exp_val)
-
-            if exp_fmt != target_exp:
-                continue
-
-            # this is our contract
-            match_row = row
-            break
-
-        if not match_row:
-            # couldn't match this exact contract, return safe fallback
-            return fallback
-
-        token = match_row.get("instrument_token")
-        if not token:
-            return fallback
-
-        # 3. now we ask quote() for this instrument_token
-        quote_key = token  # for index, we send "NSE:XYZ", but for derivatives we send numeric token
-        q = kite_local.quote([quote_key])
-
-        qdata = q.get(str(quote_key)) or q.get(quote_key)
-        if not qdata:
-            return fallback
-
-        ltp = qdata.get("last_price")
-        iv_val = qdata.get("implied_volatility")
+        # expiry_days to help theta scaling:
+        import datetime
+        today = datetime.datetime.utcnow().date()
+        expd  = datetime.datetime.strptime(expiry_std, "%Y-%m-%d").date()
+        expiry_days = max((expd - today).days, 0)
 
         return {
-            "premium": ltp,
-            "iv": iv_val,
-            "lot_size": CACHE["lot_sizes"].get(instrument, 75),
-            "note": "live"
+            "option_price": option_price,
+            "iv": iv,
+            "delta": delta,
+            "theta": theta,
+            "vega": vega,
+            "lotSize": lotSize,
+            "expiry_days": expiry_days,
+            "tradingsymbol": tradingsymbol,
         }
 
     except Exception as e:
-        print("[OPTION_QUOTE ERROR]", str(e))
-        return fallback
-
+        raise HTTPException(status_code=500, detail=str(e))
 # ----------------- ROUTES (ADMIN) -----------------
 @app.post("/admin/set_token")
 async def set_token(request: Request, body: TokenBody):
