@@ -23,53 +23,65 @@ KITE_API_KEY = os.getenv("KITE_API_KEY", "")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET", "")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
+# in-memory runtime state
 STATE = {
-    "access_token": None,
-    "last_fetch_ts": None,
-    "spot": {},
-    "option_cache": {},
-    "instrument_dump": [],
-    "instrument_last_pull": 0,
+    "access_token": None,       # Zerodha access_token (refresh daily)
+    "last_fetch_ts": None,      # "2025-10-27 06:02:10"
+    "spot": {},                 # {"NIFTY_50": 25977.4, "BANKNIFTY": 51234.5}
+    "option_cache": {},         # per tradingsymbol last good quote
+    "instrument_dump": [],      # list of NFO instruments from kite.instruments("NFO")
+    "instrument_last_pull": 0,  # epoch seconds of last pull for instruments
     "snapshot_loaded": False,
 }
 
+# hardcoded lot sizes (futures & options market lot sizes)
 LOT_SIZES = {
     "NIFTY_50": 75,
     "BANKNIFTY": 35,
-    "SENSEX": 20,  # ✅ Added correct lot size for SENSEX
+    # extend later: FINNIFTY, MIDCPNIFTY etc.
 }
 
 SNAPSHOT_FILE = "snapshot.json"
-INSTRUMENT_REFRESH_SECONDS = 300
+INSTRUMENT_REFRESH_SECONDS = 300  # refresh contract list every 5 min
 APP_START_TIME = time.time()
 
 # -------------------------
-# FASTAPI setup
+# FASTAPI init + CORS
 # -------------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Shopify storefront will iframe / embed from a different domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------
-# Helper functions
+# Helpers
 # -------------------------
+
 def _kite_client() -> KiteConnect:
+    """
+    Returns a KiteConnect client with api_key and access_token injected.
+    Raises if we don't have access_token yet.
+    """
     if not KITE_API_KEY:
         raise Exception("KITE_API_KEY not configured")
     if not STATE["access_token"]:
         raise Exception("No access token loaded")
+
     kc = KiteConnect(api_key=KITE_API_KEY)
     kc.set_access_token(STATE["access_token"])
     return kc
 
 
 def _save_snapshot_to_disk():
+    """
+    Write snapshot of (spot, last_fetch_ts, option_cache minimal) to disk,
+    so Render cold start can still answer /latest without live fetch.
+    """
     try:
         snap = {
             "last_fetch_ts": STATE["last_fetch_ts"],
@@ -84,6 +96,9 @@ def _save_snapshot_to_disk():
 
 
 def _load_snapshot_from_disk():
+    """
+    On boot, try to recover last known data.
+    """
     if STATE["snapshot_loaded"]:
         return
     try:
@@ -102,253 +117,474 @@ def _load_snapshot_from_disk():
 
 
 def _parse_expiry_label(dt: datetime) -> str:
+    # Show human label like "28 Oct 2025"
     return dt.strftime("%d %b %Y")
 
 
 def _maybe_pull_instruments():
+    """
+    Pull the full NFO instruments (option chain definitions) from Zerodha.
+    Cache in STATE["instrument_dump"].
+    We'll attempt this every INSTRUMENT_REFRESH_SECONDS, and skip if token missing.
+    """
     now = time.time()
     if now - STATE["instrument_last_pull"] < INSTRUMENT_REFRESH_SECONDS:
-        return
+        return  # recently pulled
+
     try:
         kc = _kite_client()
-        instruments = kc.instruments("NFO")
+        instruments = kc.instruments("NFO")  # big list of dicts
         STATE["instrument_dump"] = instruments
         STATE["instrument_last_pull"] = now
         print("[INSTRUMENTS] pulled", len(instruments))
     except Exception as e:
+        # token might be stale or market down. Keep old list.
         print("[INSTRUMENTS ERROR]", e)
 
 
-def _map_underlying(instrument_name: str) -> str:
-    """✅ Unified mapping for NIFTY, BANKNIFTY, SENSEX"""
-    if instrument_name == "NIFTY_50":
-        return "NIFTY"
-    elif instrument_name == "BANKNIFTY":
-        return "BANKNIFTY"
-    elif instrument_name == "SENSEX":
-        return "SENSEX"
-    else:
-        return instrument_name
-
-
 def _build_expiry_list_for_symbol(instrument_name: str) -> List[Dict[str, str]]:
-    underlying = _map_underlying(instrument_name)
+    """
+    instrument_name: "NIFTY_50" or "BANKNIFTY" (our frontend naming)
+      map to actual underlying tradingsymbol in instrument list.
+      For now:
+        NIFTY_50 -> "NIFTY"
+        BANKNIFTY -> "BANKNIFTY"
+
+    Return sorted unique expiries for that index from STATE["instrument_dump"].
+    """
+    underlying = "NIFTY" if instrument_name == "NIFTY_50" else "BANKNIFTY"
+
     expiries = set()
     for row in STATE["instrument_dump"]:
         try:
             if row.get("segment") == "NFO-OPT" and row.get("name") == underlying:
+                # row["expiry"] is datetime.date or string? Usually datetime.date
                 exp_obj = row["expiry"]
-                exp_dt = datetime.fromisoformat(exp_obj) if isinstance(exp_obj, str) else datetime.combine(exp_obj, datetime.min.time())
+                if isinstance(exp_obj, str):
+                    # just in case it's string "2025-10-30"
+                    exp_dt = datetime.fromisoformat(exp_obj)
+                else:
+                    # date -> convert to datetime midnight
+                    exp_dt = datetime.combine(exp_obj, datetime.min.time())
+
                 expiries.add(exp_dt)
         except:
             continue
-    expiries_sorted = sorted(expiries)[:4]
-    return [{"label": _parse_expiry_label(dt_exp), "value": dt_exp.date().isoformat()} for dt_exp in expiries_sorted]
+
+    # sort ascending
+    expiries_sorted = sorted(expiries)
+    # limit to next 4 expiries
+    expiries_sorted = expiries_sorted[:4]
+
+    out = []
+    for dt_exp in expiries_sorted:
+        out.append({
+            "label": _parse_expiry_label(dt_exp),
+            "value": dt_exp.date().isoformat()  # "2025-10-30"
+        })
+    return out
 
 
 def _build_strike_list(instrument_name: str, expiry_iso: str) -> List[int]:
-    underlying = _map_underlying(instrument_name)
+    """
+    Return sorted strikes for that instrument+expiry (unique strike prices)
+    Filter to something sensible like +/- 1000 points around spot,
+    and step 50 for NIFTY, 100 for BANKNIFTY etc.
+    """
+    underlying = "NIFTY" if instrument_name == "NIFTY_50" else "BANKNIFTY"
+
     try:
         expiry_target = datetime.fromisoformat(expiry_iso).date()
     except:
         return []
+
     strikes = set()
     for row in STATE["instrument_dump"]:
         try:
-            if row.get("segment") == "NFO-OPT" and row.get("name") == underlying:
+            if (
+                row.get("segment") == "NFO-OPT"
+                and row.get("name") == underlying
+            ):
                 row_exp = row["expiry"]
-                row_exp_date = datetime.fromisoformat(row_exp).date() if isinstance(row_exp, str) else row_exp
+                if isinstance(row_exp, str):
+                    row_exp_date = datetime.fromisoformat(row_exp).date()
+                else:
+                    row_exp_date = row_exp
                 if row_exp_date != expiry_target:
                     continue
+
                 strike_val = row.get("strike")
-                if strike_val:
-                    strikes.add(int(round(float(strike_val))))
+                if strike_val is None:
+                    continue
+                # Only keep int-like
+                strikes.add(int(round(float(strike_val))))
         except:
             continue
+
+    # sort strikes
     sorted_strikes = sorted(strikes)
-    spot_val = STATE["spot"].get(instrument_name)
+
+    # Option: restrict to "nice" band around current spot so dropdown not insane huge
+    spot_val = None
+    if instrument_name in STATE["spot"]:
+        spot_val = STATE["spot"][instrument_name]
+
     if spot_val:
-        lower, upper = spot_val - 1500, spot_val + 1500
-        sorted_strikes = [s for s in sorted_strikes if lower <= s <= upper]
+        lower = spot_val - 1500
+        upper = spot_val + 1500
+        filtered = [s for s in sorted_strikes if (s >= lower and s <= upper)]
+        if filtered:
+            sorted_strikes = filtered
+
     return sorted_strikes
 
 
 def _find_tradingsymbol(instrument_name: str, expiry_iso: str, strike: float, opt_type: str) -> Optional[str]:
-    underlying = _map_underlying(instrument_name)
+    """
+    Find the matching contract's tradingsymbol in STATE["instrument_dump"]
+    opt_type = "CE" or "PE"
+    """
+    underlying = "NIFTY" if instrument_name == "NIFTY_50" else "BANKNIFTY"
+
     try:
         expiry_target = datetime.fromisoformat(expiry_iso).date()
     except:
         return None
+
+    best = None
     for row in STATE["instrument_dump"]:
         try:
-            if row.get("segment") == "NFO-OPT" and row.get("name") == underlying:
-                row_exp = row["expiry"]
-                row_exp_date = datetime.fromisoformat(row_exp).date() if isinstance(row_exp, str) else row_exp
-                if row_exp_date != expiry_target:
-                    continue
-                if row.get("instrument_type") == opt_type and int(round(float(row.get("strike", 0)))) == int(round(float(strike))):
-                    return row.get("tradingsymbol")
+            if row.get("segment") != "NFO-OPT":
+                continue
+            if row.get("name") != underlying:
+                continue
+
+            row_exp = row["expiry"]
+            if isinstance(row_exp, str):
+                row_exp_date = datetime.fromisoformat(row_exp).date()
+            else:
+                row_exp_date = row_exp
+
+            if row_exp_date != expiry_target:
+                continue
+
+            st = row.get("strike")
+            oi = row.get("instrument_type")  # "CE"/"PE"
+
+            if oi == opt_type and st is not None:
+                # compare strike as int
+                if int(round(float(st))) == int(round(float(strike))):
+                    best = row.get("tradingsymbol")
+                    break
         except:
             continue
-    return None
+
+    return best
 
 
 def _quote_option(tradingsymbol: str) -> Dict[str, Any]:
+    """
+    Call kite.quote("NFO:<symbol>") to get last traded price (option premium).
+    We also store in STATE["option_cache"][tradingsymbol"] so if future calls fail,
+    we can still serve last good data.
+    """
+    # try live fetch
     try:
         kc = _kite_client()
         full_symbol = "NFO:" + tradingsymbol
         q = kc.quote([full_symbol])
         data = q[full_symbol]
+
+        last_price = data.get("last_price")
+        # Zerodha REST quote() doesn't always return greeks.
+        # We'll store what we have.
         out = {
             "tradingsymbol": tradingsymbol,
-            "option_price": data.get("last_price"),
-            "iv": data.get("implied_volatility"),
+            "option_price": last_price,
+            "iv": data.get("implied_volatility"),  # may be None
             "delta": data.get("delta"),
             "theta": data.get("theta"),
             "gamma": data.get("gamma"),
             "vega": data.get("vega"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
+
         STATE["option_cache"][tradingsymbol] = out
         return out
+
     except Exception as e:
         print("[QUOTE ERROR]", tradingsymbol, e)
+        # fallback to cache
         cached = STATE["option_cache"].get(tradingsymbol)
         if cached:
-            cached["stale"] = True
-            return cached
+            fail_out = dict(cached)
+            fail_out["stale"] = True
+            return fail_out
+
         raise HTTPException(status_code=500, detail="quote failed and no cache")
 
 
 def _fetch_spot_loop():
+    """
+    Background thread:
+    - Pull index spot from quote()
+    - Save STATE["spot"] and STATE["last_fetch_ts"]
+    - Refresh instruments every ~5 min
+    - Save snapshot.json
+    """
     while True:
         try:
+            # refresh instruments list occasionally
             _maybe_pull_instruments()
+
             if not STATE["access_token"]:
+                # can't hit Kite live, just sleep
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
+
             kc = _kite_client()
+
+            quotes_req = []
+            # map our naming -> Zerodha indices
+            # NIFTY_50 -> NSE:NIFTY 50
+            # BANKNIFTY -> NSE:BANKNIFTY
             mapping = {
                 "NIFTY_50": "NSE:NIFTY 50",
                 "BANKNIFTY": "NSE:BANKNIFTY",
-                "SENSEX": "BSE:SENSEX",  # ✅ Added live Sensex feed
             }
-            q = kc.quote(list(mapping.values()))
-            new_spot = {k: q[v]["last_price"] for k, v in mapping.items() if v in q}
+            for k, v in mapping.items():
+                quotes_req.append(v)
+
+            q = kc.quote(quotes_req)
+
+            new_spot = {}
+            for ui_name, kite_name in mapping.items():
+                if kite_name in q and "last_price" in q[kite_name]:
+                    new_spot[ui_name] = q[kite_name]["last_price"]
+
             if new_spot:
                 STATE["spot"] = new_spot
                 STATE["last_fetch_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print("[FETCH OK]", STATE["last_fetch_ts"], STATE["spot"])
                 _save_snapshot_to_disk()
+            else:
+                print("[FETCH WARN] got no spot data")
+
         except Exception as e:
             print("[FETCH ERROR]", e)
             traceback.print_exc()
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
+
 # -------------------------
-# ROUTES
+# Pydantic models
 # -------------------------
+
 class AdminTokenBody(BaseModel):
     access_token: str
 
 
+# -------------------------
+# ROUTES
+# -------------------------
+
 @app.on_event("startup")
 def on_startup():
+    # load snapshot for cold start
     _load_snapshot_from_disk()
+    # also load persisted token if we wrote one earlier
     if os.path.exists("access_token.json"):
         try:
             with open("access_token.json", "r") as f:
                 data = json.load(f)
-            STATE["access_token"] = data.get("access_token")
+            if "access_token" in data:
+                STATE["access_token"] = data["access_token"]
+                print("[BOOT] access_token restored from file.")
         except Exception as e:
-            print("[BOOT TOKEN RESTORE ERROR]", e)
-    threading.Thread(target=_fetch_spot_loop, daemon=True).start()
+            print("[BOOT] can't restore token:", e)
+
+    # start background fetch thread
+    t = threading.Thread(target=_fetch_spot_loop, daemon=True)
+    t.start()
     print("[THREAD] fetch_market_data_loop started")
 
 
 @app.get("/")
 def root():
-    return {"message": "HedgeAI backend online", "token_present": bool(STATE["access_token"])}
+    return {
+        "message": "HedgeAI backend online",
+        "token_present": bool(STATE["access_token"]),
+        "last_fetch_ts": STATE["last_fetch_ts"],
+        "uptime_sec": int(time.time() - APP_START_TIME),
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "token_present": bool(STATE["access_token"]),
+        "cached_at": STATE["last_fetch_ts"],
+        "stale": _is_stale(),
+    }
 
 
 def _is_stale() -> bool:
+    """
+    Mark data stale if last_fetch_ts is older than ~2 min.
+    """
     if not STATE["last_fetch_ts"]:
         return True
     try:
         ts = datetime.strptime(STATE["last_fetch_ts"], "%Y-%m-%d %H:%M:%S")
-        return (datetime.now() - ts).total_seconds() > 120
     except:
         return True
+    age = datetime.now() - ts
+    return age.total_seconds() > 120
 
 
 @app.get("/latest")
 def latest():
-    return {"status": "ok", "data": {"cached_at": STATE["last_fetch_ts"], "spot": STATE["spot"], "lot_sizes": LOT_SIZES, "stale": _is_stale()}}
+    """
+    Returns spot, lot sizes, last fetch time, and stale flag.
+    Frontend uses this to show:
+      - Index Spot
+      - Lot Size
+      - Whether data is fresh
+    """
+    out = {
+        "cached_at": STATE["last_fetch_ts"],
+        "spot": STATE["spot"],
+        "lot_sizes": LOT_SIZES,
+        "stale": _is_stale(),
+    }
+    # If we literally have nothing, keep a nice fallback
+    if not STATE["spot"]:
+        return {
+            "status": "ok",
+            "data": out,
+            "note": "no live spot yet, using snapshot/offline"
+        }
+    return {"status": "ok", "data": out}
 
 
 @app.get("/expiries")
 def get_expiries(instrument: str):
+    """
+    ?instrument=NIFTY_50
+    returns next ~4 expiries like:
+    [
+      {"label":"28 Oct 2025","value":"2025-10-28"},
+      {"label":"04 Nov 2025","value":"2025-11-04"},
+      ...
+    ]
+    """
     _maybe_pull_instruments()
     if not STATE["instrument_dump"]:
         raise HTTPException(status_code=500, detail="no instruments cache yet")
-    return {"instrument": instrument, "expiries": _build_expiry_list_for_symbol(instrument)}
+
+    expiries = _build_expiry_list_for_symbol(instrument)
+    return {
+        "instrument": instrument,
+        "expiries": expiries
+    }
 
 
 @app.get("/strikes")
 def get_strikes(instrument: str, expiry: str):
+    """
+    ?instrument=NIFTY_50&expiry=2025-10-30
+    returns [25600,25650,...]
+    """
     _maybe_pull_instruments()
     if not STATE["instrument_dump"]:
         raise HTTPException(status_code=500, detail="no instruments cache yet")
-    return {"instrument": instrument, "expiry": expiry, "strikes": _build_strike_list(instrument, expiry)}
+
+    strikes = _build_strike_list(instrument, expiry)
+    return {
+        "instrument": instrument,
+        "expiry": expiry,
+        "strikes": strikes
+    }
 
 
 @app.get("/option_quote")
 def option_quote(instrument: str, expiry: str, strike: float, opt_type: str):
+    """
+    ?instrument=NIFTY_50&expiry=2025-10-30&strike=25900&opt_type=CE
+    returns {
+      "tradingsymbol": "...",
+      "option_price": 112.5,
+      "iv": 13.2,
+      "delta": 0.42,
+      "theta": -18.5,
+      "gamma": 0.0021,
+      "vega": 5.3,
+      "lot_size": 75,
+      "spot_now": 25977.4,
+      "stale": false
+    }
+    """
     _maybe_pull_instruments()
+    if not STATE["instrument_dump"]:
+        raise HTTPException(status_code=500, detail="no instruments cache yet")
+
     tsym = _find_tradingsymbol(instrument, expiry, strike, opt_type)
     if not tsym:
         raise HTTPException(status_code=404, detail="No matching option contract")
-    q = _quote_option(tsym)
-    q.update({"instrument": instrument, "expiry": expiry, "strike": strike, "opt_type": opt_type, "spot_now": STATE["spot"].get(instrument), "lot_size": LOT_SIZES.get(instrument), "stale": _is_stale()})
-    return q
 
-
-@app.get("/futures_quote")  # ✅ NEW endpoint
-def futures_quote(instrument: str):
-    """
-    Example:
-      /futures_quote?instrument=NIFTY_50
-      /futures_quote?instrument=SENSEX
-    """
     try:
-        _maybe_pull_instruments()
-        kc = _kite_client()
-        underlying = _map_underlying(instrument)
-        fut_contract = None
-        for row in STATE["instrument_dump"]:
-            if row.get("segment") == "NFO-FUT" and row.get("name") == underlying:
-                fut_contract = "NFO:" + row["tradingsymbol"]
-                break
-        if not fut_contract:
-            raise HTTPException(status_code=404, detail="No futures contract found")
-        q = kc.quote([fut_contract])
-        fut_price = q[fut_contract]["last_price"]
-        return {"instrument": instrument, "fut_symbol": fut_contract, "fut_price": fut_price, "lot_size": LOT_SIZES.get(instrument), "timestamp": datetime.now(timezone.utc).isoformat()}
+        q = _quote_option(tsym)
+    except HTTPException as e:
+        # bubble up HTTPException directly
+        raise e
     except Exception as e:
-        print("[/futures_quote ERROR]", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="futures quote failed")
+        print("[option_quote ERROR]", e)
+        raise HTTPException(status_code=500, detail="quote failed")
+
+    # include context for frontend
+    q["instrument"] = instrument
+    q["expiry"] = expiry
+    q["strike"] = strike
+    q["opt_type"] = opt_type
+    q["spot_now"] = STATE["spot"].get(instrument)
+    q["lot_size"] = LOT_SIZES.get(instrument)
+
+    # stale if our global spot data is stale
+    q["stale"] = _is_stale()
+
+    return q
 
 
 @app.post("/admin/set_token")
 async def set_token(request: Request, body: AdminTokenBody):
+    """
+    Admin route:
+    - header: X-ADMIN-KEY must match ADMIN_KEY
+    - body: { "access_token": "<Zerodha access token>" }
+    Saves token in memory AND writes access_token.json so it persists restarts.
+    """
     admin_header = request.headers.get("X-ADMIN-KEY", "")
     if admin_header != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized admin key")
+
     token = body.access_token.strip()
+    if not token or len(token) < 5:
+        raise HTTPException(status_code=400, detail="Bad token")
+
     STATE["access_token"] = token
-    with open("access_token.json", "w") as f:
-        json.dump({"access_token": token}, f)
+    print("[TOKEN UPDATED VIA ADMIN]", token[:10] + "******")
+
+    # persist token to disk so Render restart can reload
+    try:
+        with open("access_token.json", "w") as f:
+            json.dump({"access_token": token}, f)
+        print("[TOKEN SAVED TO DISK]")
+    except Exception as e:
+        print("[TOKEN DISK SAVE ERROR]", e)
+
+    # force refresh instruments next request
     STATE["instrument_last_pull"] = 0
-    print("[TOKEN UPDATED]")
-    return {"status": "ok", "message": "token saved"}
+
+    return {"status": "ok", "message": "token saved and fetch started"}
