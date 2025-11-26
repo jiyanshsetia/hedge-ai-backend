@@ -438,33 +438,49 @@ def health():
 @app.get("/futures_quote")
 def futures_quote(instrument: str):
     """
-    ?instrument=NIFTY_50 or SENSEX
-    returns {
-      "instrument": "NIFTY_50",
-      "fut_price": 26250.5,
-      "lot_size": 75,
-      "timestamp": ...
-    }
+    Example:
+      /futures_quote?instrument=NIFTY_50
+      /futures_quote?instrument=SENSEX
+    Returns the latest futures LTP from Kite Connect.
     """
     try:
         kc = _kite_client()
-        if instrument == "NIFTY_50":
-            symbol = "NFO:NIFTY24NOVFUT"
-        elif instrument == "SENSEX":
-            symbol = "NFO:SENSEX24NOVFUT"
-        else:
-            raise HTTPException(status_code=400, detail="unsupported instrument")
 
-        q = kc.quote([symbol])
-        fut_price = q[symbol]["last_price"]
+        # Map UI instrument name to Zerodha tradingsymbol
+        if instrument == "NIFTY_50":
+            symbol = "NFO:NIFTY"  # We’ll pick nearest expiry
+        elif instrument == "SENSEX":
+            symbol = "NFO:SENSEX"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported instrument {instrument}")
+
+        # Try to find the nearest FUT contract from instruments list
+        _maybe_pull_instruments()
+        fut_symbol = None
+        for row in STATE["instrument_dump"]:
+            if row.get("segment") == "NFO-FUT" and row.get("name") == symbol.split(":")[1]:
+                fut_symbol = "NFO:" + row["tradingsymbol"]
+                break
+
+        if not fut_symbol:
+            raise HTTPException(status_code=404, detail="No futures contract found")
+
+        q = kc.quote([fut_symbol])
+        fut_price = q[fut_symbol]["last_price"]
+
         return {
             "instrument": instrument,
+            "fut_symbol": fut_symbol,
             "fut_price": fut_price,
-            "lot_size": LOT_SIZES.get(instrument),
+            "lot_size": LOT_SIZES.get(instrument, 50),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        print("[FUTURE QUOTE ERROR]", e)
+        print("[/futures_quote ERROR]", e)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="futures quote failed")
 
 def _is_stale() -> bool:
