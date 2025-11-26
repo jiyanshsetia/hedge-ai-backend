@@ -38,7 +38,7 @@ STATE = {
 LOT_SIZES = {
     "NIFTY_50": 75,
     "BANKNIFTY": 35,
-    # extend later: FINNIFTY, MIDCPNIFTY etc.
+    "SENSEX": 20,  # ✅ Correct lot size for SENSEX
 }
 
 SNAPSHOT_FILE = "snapshot.json"
@@ -152,8 +152,14 @@ def _build_expiry_list_for_symbol(instrument_name: str) -> List[Dict[str, str]]:
 
     Return sorted unique expiries for that index from STATE["instrument_dump"].
     """
-    underlying = "NIFTY" if instrument_name == "NIFTY_50" else "BANKNIFTY"
-
+if instrument_name == "NIFTY_50":
+    underlying = "NIFTY"
+elif instrument_name == "BANKNIFTY":
+    underlying = "BANKNIFTY"
+elif instrument_name == "SENSEX":
+    underlying = "SENSEX"  # ✅ Added Sensex mapping
+else:
+    underlying = instrument_name
     expiries = set()
     for row in STATE["instrument_dump"]:
         try:
@@ -349,9 +355,10 @@ def _fetch_spot_loop():
             # NIFTY_50 -> NSE:NIFTY 50
             # BANKNIFTY -> NSE:BANKNIFTY
             mapping = {
-                "NIFTY_50": "NSE:NIFTY 50",
-                "BANKNIFTY": "NSE:BANKNIFTY",
-            }
+    "NIFTY_50": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:BANKNIFTY",
+    "SENSEX": "BSE:SENSEX",  # ✅ Added Sensex live spot
+}
             for k, v in mapping.items():
                 quotes_req.append(v)
 
