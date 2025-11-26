@@ -435,7 +435,37 @@ def health():
         "cached_at": STATE["last_fetch_ts"],
         "stale": _is_stale(),
     }
+@app.get("/futures_quote")
+def futures_quote(instrument: str):
+    """
+    ?instrument=NIFTY_50 or SENSEX
+    returns {
+      "instrument": "NIFTY_50",
+      "fut_price": 26250.5,
+      "lot_size": 75,
+      "timestamp": ...
+    }
+    """
+    try:
+        kc = _kite_client()
+        if instrument == "NIFTY_50":
+            symbol = "NFO:NIFTY24NOVFUT"
+        elif instrument == "SENSEX":
+            symbol = "NFO:SENSEX24NOVFUT"
+        else:
+            raise HTTPException(status_code=400, detail="unsupported instrument")
 
+        q = kc.quote([symbol])
+        fut_price = q[symbol]["last_price"]
+        return {
+            "instrument": instrument,
+            "fut_price": fut_price,
+            "lot_size": LOT_SIZES.get(instrument),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        print("[FUTURE QUOTE ERROR]", e)
+        raise HTTPException(status_code=500, detail="futures quote failed")
 
 def _is_stale() -> bool:
     """
